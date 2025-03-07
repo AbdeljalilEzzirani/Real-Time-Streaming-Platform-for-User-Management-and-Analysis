@@ -1,0 +1,208 @@
+version: '3.8'
+
+services:
+  zoo1:
+    image: wurstmeister/zookeeper
+    hostname: zoo1
+    container_name: zoo1
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SERVER_ID: 1
+      ZOOKEEPER_SERVERS: zoo1:2888:3888
+    networks:
+      - global_ner
+
+  kafka1:
+    image:  wurstmeister/kafka
+    hostname: kafka1
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "9999:9999"
+    environment:
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,DOCKER://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:19092,EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092,DOCKER://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zoo1:2181"
+      KAFKA_BROKER_ID: 1
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      
+    depends_on:
+    - zoo1
+    networks:
+      - global_ner  
+  
+
+  # mongodb:
+  #   image: mongo:latest
+  #   container_name: mongodb
+  #   ports:
+  #     - "27017:27017"
+  #   volumes:
+  #     - mongo_data:/data/db
+  #   networks:
+  #     - global_ner
+
+  cassandra:
+    image: cassandra:latest
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+      - "4040:4040"
+    environment:
+      - SPARK_LOCAL_IP=0.0.0.0
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      # - SPARK_PUBLIC_DNS=localhost
+      - SPARK_MASTER_WEBUI_PORT=8080
+    entrypoint: 
+      - "bash"
+      - "-c"
+      - "/opt/spark/sbin/start-master.sh && tail -f /dev/null"
+    volumes:
+      # - ./data:/opt/spark/work-dir/spark-warehouse/data:rw
+       - ./spark-events:/opt/spark-events:rw
+       - ~/.ivy2:/root/.ivy2:rw
+    depends_on:
+      - kafka1
+    networks:
+      - global_ner 
+
+  # spark-connect:
+  #   image: apache/spark:3.5.1
+  #   container_name: spark-connect
+  #   hostname: spark-connect
+  #   ports:
+  #     - "4040:4040"
+  #     - "15002:15002"
+  #   depends_on:
+  #     - spark-master
+  #   volumes:
+  #     - ./jars/spark-connect_2.12-3.5.1.jar:/opt/spark/jars/spark-connect_2.12-3.5.1.jar
+  #     - ./data:/opt/spark/work-dir/spark-warehouse/data:rw
+  #   command: 
+  #     - "bash"
+  #     - "-c"
+  #     - "/opt/spark/sbin/start-connect-server.sh --jars /opt/spark/jars/spark-connect_2.12-3.5.1.jar && tail -f /dev/null"
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    hostname: spark-worker
+    depends_on:
+      - spark-master
+    entrypoint:
+      - "bash" 
+      - "-c"
+      - "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /dev/null"
+   
+    volumes:
+      - ./data:/opt/spark/work-dir/spark-warehouse/data:rw
+    environment:
+      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_LOCAL_IP=0.0.0.0
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      - kafka1
+    environment:
+      KAFKA_BROKER: kafka:9092
+    volumes:
+      - ./producer:/app
+    command: ["python", "app.py"]
+  
+  # consumer:
+  #   build: ./consumer
+  #   container_name: consumer
+  #   depends_on:
+  #     - kafka1
+  #   environment:
+  #     KAFKA_BROKER: kafka:9092
+  #   volumes:
+  #     - ./consumer:/app
+  #   command: ["python", "app.py"]  
+
+  # streamlit:
+  #   build: 
+  #    context: ./dashboard
+  #    dockerfile: dockerfile
+  #   container_name: streamlit_dashboard
+  #   depends_on:
+  #     - mongodb
+  #     - cassandra
+  #   ports:
+  #     - "8501:8501"
+  #   volumes:
+  #     - ./dashboard:/app
+  #   command: ["streamlit", "run", "app.py"]
+
+volumes:
+  mongo_data:
+  cassandra_data:
+networks:
+  global_ner:
+      driver: bridge
+
+
+
+      #!/bin/bash
+
+# Build the Docker image
+echo "Building the streaming-app image..."
+docker build -t streaming-app .
+
+# Stop and remove all containers from docker-compose
+echo "Stopping and removing existing containers..."
+docker-compose down
+
+# Start containers in detached mode
+echo "Starting containers with docker-compose..."
+docker-compose up -d
+
+# Wait a few seconds for containers to start
+echo "Waiting for containers to initialize..."
+sleep 5
+
+# Run producer in the background
+echo "Starting the producer..."
+docker exec -d real-time-streaming-platform-for-user-management-and-analysis_app_1 python3 /app/producer.py
+
+# Run consumer with retry logic
+echo "Starting the consumer..."
+MAX_RETRIES=3
+RETRY_COUNT=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    docker exec -it real-time-streaming-platform-for-user-management-and-analysis_app_1 python3 /app/consumer.py
+    if [ $? -eq 0 ]; then
+        echo "Consumer started successfully!"
+        break
+    else
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        echo "Consumer failed. Retry $RETRY_COUNT/$MAX_RETRIES..."
+        sleep 5
+    fi
+done
+
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    echo "Failed to start consumer after $MAX_RETRIES retries."
+else
+    echo "Done! Project restarted and consumer is running."
+fi
