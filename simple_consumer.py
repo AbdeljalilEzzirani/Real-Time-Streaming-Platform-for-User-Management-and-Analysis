@@ -24,3 +24,4 @@ query = kafka_df \
     .start()
 
 query.awaitTermination()
+
